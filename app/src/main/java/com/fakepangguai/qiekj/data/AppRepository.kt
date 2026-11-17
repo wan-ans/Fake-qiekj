@@ -16,6 +16,7 @@ class AppRepository(
     private val uiSettingsStore: UiSettingsStore,
     private val scannedDeviceStore: ScannedDeviceStore,
     private val deviceAliasStore: DeviceAliasStore,
+    private val hiddenDeviceStore: HiddenDeviceStore,
     private val logStore: LogStore,
 ) {
     private val api: DeviceApi
@@ -107,9 +108,22 @@ class AppRepository(
 
     fun scannedDevices(): List<ScannedDevice> = scannedDeviceStore.list()
 
+    /** 本地已删除（隐藏）的设备 key 集合，用于过滤服务端重新返回的历史设备。 */
+    fun hiddenDevices(): Set<String> = hiddenDeviceStore.all()
+
+    /**
+     * 删除设备：从扫码记录里移除，并记入隐藏集合，
+     * 这样服务端历史设备再次返回时也不会重新出现。
+     */
     fun removeScannedDevice(goodsId: String) {
         scannedDeviceStore.remove(goodsId)
         deviceAliasStore.remove(goodsId)
+        hiddenDeviceStore.add(goodsId)
+    }
+
+    /** 重新扫码/绑定设备时，取消该设备的隐藏状态。 */
+    fun unhideDevice(goodsId: String) {
+        hiddenDeviceStore.remove(goodsId)
     }
 
     fun deviceAliases(): Map<String, String> = deviceAliasStore.all()
@@ -182,6 +196,8 @@ class AppRepository(
             source = source,
         )
         scannedDeviceStore.add(device)
+        // 重新扫码/绑定同一台设备时，取消之前的删除（隐藏）状态。
+        hiddenDeviceStore.remove(goodsId)
         return device
     }
 

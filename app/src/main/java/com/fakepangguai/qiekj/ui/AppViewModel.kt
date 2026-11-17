@@ -49,6 +49,7 @@ data class AppUiState(
     val darkTheme: Boolean = false,
     val loginSectionExpanded: Boolean = true,
     val scannedDevices: List<ScannedDevice> = emptyList(),
+    val hiddenDevices: Set<String> = emptySet(),
     val scanning: Boolean = false,
     val deviceAliases: Map<String, String> = emptyMap(),
     val endingDeviceId: String? = null,
@@ -75,6 +76,7 @@ class AppViewModel(
             loginSectionExpanded = loginSectionInitiallyExpanded,
             phone = repository.lastPhone().orEmpty(),
             scannedDevices = repository.scannedDevices(),
+            hiddenDevices = repository.hiddenDevices(),
             deviceAliases = repository.deviceAliases(),
             devices = emptyList(),
             logging = repository.isLogging(),
@@ -134,6 +136,7 @@ class AppViewModel(
                 it.copy(
                     scanning = false,
                     scannedDevices = repository.scannedDevices(),
+                    hiddenDevices = repository.hiddenDevices(),
                     currentTab = DeviceTab.Control,
                 )
             }
@@ -279,6 +282,7 @@ class AppViewModel(
         _state.update {
             it.copy(
                 scannedDevices = repository.scannedDevices(),
+                hiddenDevices = repository.hiddenDevices(),
                 deviceAliases = repository.deviceAliases(),
             )
         }

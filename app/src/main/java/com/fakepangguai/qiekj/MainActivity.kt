@@ -87,6 +87,7 @@ import com.fakepangguai.qiekj.data.DeviceItem
 import com.fakepangguai.qiekj.data.OrderHistoryItem
 import com.fakepangguai.qiekj.data.OrderHistoryStore
 import com.fakepangguai.qiekj.data.DeviceAliasStore
+import com.fakepangguai.qiekj.data.HiddenDeviceStore
 import com.fakepangguai.qiekj.data.LogStore
 import com.fakepangguai.qiekj.data.ScannedDevice
 import com.fakepangguai.qiekj.data.ScannedDeviceStore
@@ -118,6 +119,7 @@ class MainActivity : ComponentActivity() {
                     uiSettingsStore = UiSettingsStore(applicationContext),
                     scannedDeviceStore = ScannedDeviceStore(applicationContext),
                     deviceAliasStore = DeviceAliasStore(applicationContext),
+                    hiddenDeviceStore = HiddenDeviceStore(applicationContext),
                     logStore = LogStore(),
                 )
             }
@@ -399,8 +401,8 @@ private fun ControlScreen(
             vm.scanCode(contents)
         }
     }
-    val devices = remember(state.scannedDevices, state.devices) {
-        mergeDevices(state.scannedDevices, state.devices)
+    val devices = remember(state.scannedDevices, state.devices, state.hiddenDevices) {
+        mergeDevices(state.scannedDevices, state.devices, state.hiddenDevices)
     }
     var menuDevice by remember { mutableStateOf<com.fakepangguai.qiekj.data.DeviceItem?>(null) }
     var renameTarget by remember { mutableStateOf<com.fakepangguai.qiekj.data.DeviceItem?>(null) }
@@ -481,7 +483,7 @@ private fun ControlScreen(
     menuDevice?.let { device ->
         DeviceMenuDialog(
             title = displayName(device, state.deviceAliases),
-            canDelete = device.scanned,
+            canDelete = true,
             onDismiss = { menuDevice = null },
             onRename = {
                 renameTarget = device
@@ -505,7 +507,7 @@ private fun ControlScreen(
                 menuDevice = null
             },
             onDelete = {
-                device.goodsId?.let { vm.removeScannedDevice(it) }
+                (device.goodsId ?: device.id)?.let { vm.removeScannedDevice(it) }
                 menuDevice = null
             },
         )
@@ -577,10 +579,21 @@ private fun ControlScreen(
 private fun mergeDevices(
     scannedDevices: List<ScannedDevice>,
     historyDevices: List<com.fakepangguai.qiekj.data.DeviceItem>,
+    hiddenDevices: Set<String>,
 ): List<com.fakepangguai.qiekj.data.DeviceItem> {
-    val scannedItems = scannedDevices.map { it.toDeviceItem() }
+    // 已删除（隐藏）的设备无论来自扫码记录还是服务端历史，都统一过滤掉。
+    fun isHidden(device: com.fakepangguai.qiekj.data.DeviceItem): Boolean {
+        val goodsId = device.goodsId
+        val id = device.id
+        return (goodsId != null && goodsId in hiddenDevices) ||
+            (id != null && id in hiddenDevices)
+    }
+    val scannedItems = scannedDevices.map { it.toDeviceItem() }.filterNot(::isHidden)
     val scannedIds = scannedItems.mapNotNull { it.goodsId }.toSet()
-    return scannedItems + historyDevices.filterNot { (it.goodsId ?: it.id) in scannedIds }
+    val historyItems = historyDevices
+        .filterNot { (it.goodsId ?: it.id) in scannedIds }
+        .filterNot(::isHidden)
+    return scannedItems + historyItems
 }
 
 private fun displayName(
