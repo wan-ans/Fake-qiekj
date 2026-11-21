@@ -56,6 +56,7 @@ data class AppUiState(
     val logging: Boolean = false,
     val logLines: Int = 0,
     val unpaidOrder: String? = null,
+    val unpaidOrderId: String? = null,
     val unpaidOrderPrice: String? = null,
     val accountInfo: UserInfoData? = null,
     val miniProgramRequest: String? = null,
@@ -179,9 +180,14 @@ class AppViewModel(
     /** 对未支付订单尝试自动扣款，成功后继续启动。 */
     fun payUnpaidAndStart() = viewModelScope.launch {
         val orderNo = state.value.unpaidOrder ?: return@launch
+        val orderId = state.value.unpaidOrderId
         val device = pendingStartDevice
-        _state.update { it.copy(unpaidOrder = null, unpaidOrderPrice = null) }
-        val paid = runCatching { repository.payOrderAutomatically(orderNo) }.getOrDefault(false)
+        _state.update { it.copy(unpaidOrder = null, unpaidOrderId = null, unpaidOrderPrice = null) }
+        var paid = runCatching { repository.payOrderAutomatically(orderNo) }.getOrDefault(false)
+        // 扣款失败但订单其实已支付（如已签约自动支付）时，用订单状态再核对一次。
+        if (!paid && orderId != null) {
+            paid = repository.isOrderPaid(orderId)
+        }
         if (paid) {
             showToast("未支付订单已自动扣款")
             refreshBalance()
@@ -190,7 +196,7 @@ class AppViewModel(
         } else {
             pendingStartDevice = device
             showToast("自动扣款未成功，请在官方 App 付款后再点「已支付，重试」")
-            _state.update { it.copy(unpaidOrder = orderNo) }
+            _state.update { it.copy(unpaidOrder = orderNo, unpaidOrderId = orderId) }
         }
     }
     /** 打开胖乖官方小程序付款页（自动扣款失败时的兜底）。 */
@@ -203,22 +209,29 @@ class AppViewModel(
         _state.update { it.copy(miniProgramRequest = null) }
     }
 
-    /** 后台守候：定期重试自动扣款，并检测是否已在支付宝付清。 */
-    private suspend fun watchOrderPayment(orderNo: String) {
+    /**
+     * 后台守候：定期重试自动扣款，并检测是否已在支付宝付清。
+     *
+     * 注意：订单状态只能按 orderId 查询，orderNo 查不到。所以优先用 orderId 判定，
+     * 只有拿不到 orderId 时才退化为只重试扣款。
+     */
+    private suspend fun watchOrderPayment(orderNo: String, orderId: String?) {
         for (round in 1..120) {
             delay(5000)
-            if (repository.isOrderPaid(orderNo)) {
+            if (orderId != null && repository.isOrderPaid(orderId)) {
                 repository.log("订单 " + orderNo + " 已支付（外部渠道）")
-                _state.update { it.copy(unpaidOrder = null, unpaidOrderPrice = null) }
+                _state.update { it.copy(unpaidOrder = null, unpaidOrderId = null, unpaidOrderPrice = null) }
                 showToast("订单已支付")
                 refreshBalance()
                 return
             }
             if (round % 3 == 0) {
                 val paid = runCatching { repository.payOrderAutomatically(orderNo) }.getOrDefault(false)
-                if (paid) {
-                    _state.update { it.copy(unpaidOrder = null, unpaidOrderPrice = null) }
-                    showToast("欠单已自动扣款")
+                // 扣款失败时再用订单状态核对一次，避免把已支付误判成未支付。
+                val settled = paid || (orderId != null && repository.isOrderPaid(orderId))
+                if (settled) {
+                    _state.update { it.copy(unpaidOrder = null, unpaidOrderId = null, unpaidOrderPrice = null) }
+                    showToast(if (paid) "欠单已自动扣款" else "订单已支付")
                     refreshBalance()
                     return
                 }
@@ -229,7 +242,7 @@ class AppViewModel(
     fun retryAfterUnpaid() = viewModelScope.launch {
         val device = pendingStartDevice
         pendingStartDevice = null
-        _state.update { it.copy(unpaidOrder = null, unpaidOrderPrice = null) }
+        _state.update { it.copy(unpaidOrder = null, unpaidOrderId = null, unpaidOrderPrice = null) }
         if (device != null) {
             unlock(device)
         } else {
@@ -239,7 +252,7 @@ class AppViewModel(
 
     fun dismissUnpaidOrder() {
         pendingStartDevice = null
-        _state.update { it.copy(unpaidOrder = null, unpaidOrderPrice = null) }
+        _state.update { it.copy(unpaidOrder = null, unpaidOrderId = null, unpaidOrderPrice = null) }
     }
     fun showAccountInfo() = viewModelScope.launch {
         runCatching { repository.userInfo() }
@@ -443,12 +456,12 @@ class AppViewModel(
             if (error is UnpaidOrderException) {
                 pendingStartDevice = device
                 repository.log("检测到未支付订单：" + error.orderNo)
-                _state.update { it.copy(unpaidOrder = error.orderNo, unpaidOrderPrice = null) }
-                val price = repository.orderPayPrice(error.orderNo)
+                _state.update { it.copy(unpaidOrder = error.orderNo, unpaidOrderId = error.orderId, unpaidOrderPrice = null) }
+                val price = error.orderId?.let { repository.orderPayPrice(it) }
                 _state.update {
                     it.copy(unpaidOrderPrice = price, miniProgramRequest = error.orderNo)
                 }
-                watchOrderPayment(error.orderNo)
+                watchOrderPayment(error.orderNo, error.orderId)
             } else {
                 showFailure(error, "启动失败")
             }
@@ -473,16 +486,17 @@ class AppViewModel(
                 if (result != null) {
                     showToast("用水结束：原价 " + result.originPrice + "，小票 " + result.ticketCost)
                     if (!result.autoPaid) {
-                        // 没自动结清就立刻把欠单弹出来，方便马上付款
+                        // 只有确认没结清才弹欠单、拉起小程序；autoPaid 已按服务端订单状态判定过。
                         pendingStartDevice = null
                         _state.update {
                             it.copy(
                                 unpaidOrder = result.orderNo,
+                                unpaidOrderId = result.orderId,
                                 unpaidOrderPrice = result.originPrice,
                                 miniProgramRequest = result.orderNo,
                             )
                         }
-                        watchOrderPayment(result.orderNo)
+                        watchOrderPayment(result.orderNo, result.orderId)
                     }
                 } else {
                     showToast("本次未出水，未产生费用")
@@ -513,12 +527,12 @@ class AppViewModel(
             if (error is UnpaidOrderException) {
                 pendingStartDevice = device
                 repository.log("检测到未支付订单：" + error.orderNo)
-                _state.update { it.copy(unpaidOrder = error.orderNo, unpaidOrderPrice = null) }
-                val price = repository.orderPayPrice(error.orderNo)
+                _state.update { it.copy(unpaidOrder = error.orderNo, unpaidOrderId = error.orderId, unpaidOrderPrice = null) }
+                val price = error.orderId?.let { repository.orderPayPrice(it) }
                 _state.update {
                     it.copy(unpaidOrderPrice = price, miniProgramRequest = error.orderNo)
                 }
-                watchOrderPayment(error.orderNo)
+                watchOrderPayment(error.orderNo, error.orderId)
             } else {
                 showFailure(error, "设备启动失败")
             }

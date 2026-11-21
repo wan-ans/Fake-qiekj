@@ -48,16 +48,24 @@ class AppRepository(
             .create(DeviceApi::class.java)
     }
 
-    /** 查询订单应付金额（用于未支付订单提示）。 */
+    /** 查询订单应付金额（用于未支付订单提示）。注意传的是 orderId，不是 orderNo。 */
     suspend fun orderPayPrice(orderId: String): String? = runCatching {
         api.orderDetail(orderId = orderId, token = requireToken()).data?.payPrice
     }.getOrNull()
 
-    /** 订单是否已支付（orderStatus 非 0 视为已付）。 */
-    suspend fun isOrderPaid(orderId: String): Boolean = runCatching {
-        val status = api.orderDetail(orderId = orderId, token = requireToken()).data?.orderStatus
-        status != null && status != 0
-    }.getOrDefault(false)
+    /**
+     * 按订单 ID 查询订单是否已支付（orderStatus 非 0 视为已付）。
+     *
+     * 注意：order/detail 只认 orderId（订单 ID），不能传 orderNo（订单号），
+     * 两者不是一回事，传错会导致查询失败、永远判定为未支付。
+     */
+    suspend fun isOrderPaid(orderId: String): Boolean {
+        if (orderId.isBlank()) return false
+        return runCatching {
+            val status = api.orderDetail(orderId = orderId, token = requireToken()).data?.orderStatus
+            status != null && status != 0
+        }.getOrDefault(false)
+    }
 
     fun log(message: String) {
         logStore.append(message)
@@ -249,7 +257,10 @@ class AppRepository(
         onStep("正在获取出水口")
         val skuEnvelope = api.goodsid2sku(goodsId = goodsId, token = token)
         if (skuEnvelope.code == UNPAID_ORDER_CODE) {
-            throw UnpaidOrderException(skuEnvelope.data?.incompleteOrderNo.orEmpty())
+            throw UnpaidOrderException(
+                orderNo = skuEnvelope.data?.incompleteOrderNo.orEmpty(),
+                orderId = skuEnvelope.data?.incompleteOrderId,
+            )
         }
         skuEnvelope.throwIfFailed()
         val skuId = skuEnvelope.data?.skus?.firstOrNull()?.skuId
@@ -327,7 +338,10 @@ class AppRepository(
         onStep("正在获取 SKU")
         val skuEnvelope = api.goodsid2sku(goodsId = goodsId, token = token)
         if (skuEnvelope.code == UNPAID_ORDER_CODE) {
-            throw UnpaidOrderException(skuEnvelope.data?.incompleteOrderNo.orEmpty())
+            throw UnpaidOrderException(
+                orderNo = skuEnvelope.data?.incompleteOrderNo.orEmpty(),
+                orderId = skuEnvelope.data?.incompleteOrderId,
+            )
         }
         skuEnvelope.throwIfFailed()
         val skuId = skuEnvelope.data?.skus?.firstOrNull()?.skuId
@@ -394,10 +408,21 @@ class AppRepository(
         // 设备端没有人按“出水”，或出水量为 0 时，不会有后付订单，属于正常情况。
         val orderId = createEnvelope.data?.orderId ?: return null
 
-        // 订单建好后立刻尝试自动结算，避免留下未支付订单把下次启动卡住（服务端 code 2128）。
-        val paid = runCatching { payOrderAutomatically(finalOrderNo) }.getOrDefault(false)
-        if (!paid) {
-            logStore.append("订单 " + finalOrderNo + " 未自动结清，需要手动支付")
+        // 订单建好后先看服务端订单状态：用户签约了自动支付时，服务端在建单时可能已经扣款完成，
+        // 这时我们自己再去扣款会因为「订单已支付」而失败，不能据此判定为未支付。
+        var paid = runCatching { isOrderPaid(orderId) }.getOrDefault(false)
+        if (paid) {
+            logStore.append("订单 " + finalOrderNo + " 已由服务端自动支付完成，无需再次扣款")
+        } else {
+            // 未支付才尝试主动结算，避免留下未支付订单把下次启动卡住（服务端 code 2128）。
+            paid = runCatching { payOrderAutomatically(finalOrderNo) }.getOrDefault(false)
+            // 主动扣款失败时再核对一次订单状态：可能已被其它渠道/自动签约扣款成功。
+            if (!paid) {
+                paid = runCatching { isOrderPaid(orderId) }.getOrDefault(false)
+            }
+            if (!paid) {
+                logStore.append("订单 " + finalOrderNo + " 未自动结清，需要手动支付")
+            }
         }
 
         onStep("正在查询订单详情")

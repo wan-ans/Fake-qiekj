@@ -71,6 +71,7 @@ data class SkuResult(
 /** 设备被未支付订单卡住时抛出，UI 引导用户支付后重试。 */
 class UnpaidOrderException(
     val orderNo: String,
+    val orderId: String? = null,
     message: String = "有未支付订单需要完成",
 ) : IllegalStateException(message)
 
